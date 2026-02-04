@@ -8,6 +8,9 @@ const BaileysStore = require('./BaileysStore');
 const MessageFormatter = require('./MessageFormatter');
 const wsManager = require('../websocket/WebSocketManager');
 
+// Supabase integration
+const { useSupabaseAuthState, deleteSupabaseAuthState, SupabaseStorage, isSupabaseConfigured, getSupabaseClient } = require('../supabase');
+
 /**
  * WhatsApp Session Class
  * Mengelola satu sesi WhatsApp
@@ -26,19 +29,46 @@ class WhatsAppSession {
         this.name = null;
         this.store = null;
         this.storeInterval = null;
-        
+
+        // Supabase integration
+        this.useSupabase = isSupabaseConfigured();
+        this.supabaseStorage = this.useSupabase ? new SupabaseStorage(sessionId) : null;
+
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
         this.webhooks = options.webhooks || []; // Array of { url, events? }
-        
-        // Load config if exists
+
+        // Load config if exists (async for Supabase)
         this._loadConfig();
     }
-    
+
     /**
      * Load session config from file
      */
-    _loadConfig() {
+    async _loadConfig() {
+        // Try Supabase first if configured
+        if (this.useSupabase) {
+            try {
+                const supabase = getSupabaseClient();
+                const { data, error } = await supabase
+                    .from('wa_sessions')
+                    .select('metadata, webhooks, phone_number, name')
+                    .eq('session_id', this.sessionId)
+                    .single();
+
+                if (!error && data) {
+                    this.metadata = data.metadata || this.metadata;
+                    this.webhooks = data.webhooks || this.webhooks;
+                    this.phoneNumber = data.phone_number || this.phoneNumber;
+                    this.name = data.name || this.name;
+                    return;
+                }
+            } catch (e) {
+                console.log(`⚠️ [${this.sessionId}] Could not load config from Supabase:`, e.message);
+            }
+        }
+
+        // Fallback to file-based config
         try {
             if (fs.existsSync(this.configFile)) {
                 const config = JSON.parse(fs.readFileSync(this.configFile, 'utf8'));
@@ -49,11 +79,33 @@ class WhatsAppSession {
             console.log(`⚠️ [${this.sessionId}] Could not load config:`, e.message);
         }
     }
-    
+
     /**
      * Save session config to file
      */
-    _saveConfig() {
+    async _saveConfig() {
+        // Save to Supabase if configured
+        if (this.useSupabase) {
+            try {
+                const supabase = getSupabaseClient();
+                await supabase
+                    .from('wa_sessions')
+                    .upsert({
+                        session_id: this.sessionId,
+                        phone_number: this.phoneNumber,
+                        name: this.name,
+                        status: this.connectionStatus,
+                        metadata: this.metadata,
+                        webhooks: this.webhooks
+                    }, {
+                        onConflict: 'session_id'
+                    });
+            } catch (e) {
+                console.log(`⚠️ [${this.sessionId}] Could not save config to Supabase:`, e.message);
+            }
+        }
+
+        // Also save to file as fallback/backup
         try {
             if (!fs.existsSync(this.authFolder)) {
                 fs.mkdirSync(this.authFolder, { recursive: true });
@@ -66,7 +118,7 @@ class WhatsAppSession {
             console.log(`⚠️ [${this.sessionId}] Could not save config:`, e.message);
         }
     }
-    
+
     /**
      * Update session config
      */
@@ -80,7 +132,7 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Add a webhook URL
      */
@@ -95,7 +147,7 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Remove a webhook URL
      */
@@ -104,13 +156,13 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Send webhook notification to all configured webhook URLs
      */
     async _sendWebhook(event, data) {
         if (!this.webhooks || this.webhooks.length === 0) return;
-        
+
         const payload = {
             event,
             sessionId: this.sessionId,
@@ -118,7 +170,7 @@ class WhatsAppSession {
             data,
             timestamp: new Date().toISOString()
         };
-        
+
         // Send to all webhooks in parallel
         const promises = this.webhooks.map(async (webhook) => {
             // Check if event should be sent to this webhook
@@ -126,7 +178,7 @@ class WhatsAppSession {
             if (!events.includes('all') && !events.includes(event)) {
                 return;
             }
-            
+
             try {
                 const response = await fetch(webhook.url, {
                     method: 'POST',
@@ -138,7 +190,7 @@ class WhatsAppSession {
                     },
                     body: JSON.stringify(payload)
                 });
-                
+
                 if (!response.ok) {
                     console.log(`⚠️ [${this.sessionId}] Webhook to ${webhook.url} failed: ${response.status}`);
                 }
@@ -146,45 +198,79 @@ class WhatsAppSession {
                 console.log(`⚠️ [${this.sessionId}] Webhook to ${webhook.url} error:`, error.message);
             }
         });
-        
+
         // Wait for all webhooks to complete (non-blocking)
-        Promise.all(promises).catch(() => {});
+        Promise.all(promises).catch(() => { });
     }
 
     // ==================== CONNECTION ====================
 
     async connect() {
         try {
-            // Pastikan folder auth ada
-            if (!fs.existsSync(this.authFolder)) {
-                fs.mkdirSync(this.authFolder, { recursive: true });
-            }
-
             // Initialize custom in-memory store with sessionId
             this.store = new BaileysStore(this.sessionId);
 
-            // Load existing store data if available
-            if (fs.existsSync(this.storeFile)) {
-                try {
-                    this.store.readFromFile(this.storeFile);
-                    console.log(`📂 [${this.sessionId}] Store data loaded from file`);
-                } catch (e) {
-                    console.log(`⚠️ [${this.sessionId}] Could not load store file:`, e.message);
+            // Load existing store data
+            if (this.useSupabase) {
+                // Try to load from Supabase first
+                const loaded = await this.store.loadFromSupabase();
+                if (!loaded && fs.existsSync(this.storeFile)) {
+                    // Fallback to file if Supabase fails
+                    try {
+                        this.store.readFromFile(this.storeFile);
+                        console.log(`📂 [${this.sessionId}] Store data loaded from file (fallback)`);
+                    } catch (e) {
+                        console.log(`⚠️ [${this.sessionId}] Could not load store file:`, e.message);
+                    }
+                }
+            } else {
+                // Filesystem-only mode
+                if (!fs.existsSync(this.authFolder)) {
+                    fs.mkdirSync(this.authFolder, { recursive: true });
+                }
+                if (fs.existsSync(this.storeFile)) {
+                    try {
+                        this.store.readFromFile(this.storeFile);
+                        console.log(`📂 [${this.sessionId}] Store data loaded from file`);
+                    } catch (e) {
+                        console.log(`⚠️ [${this.sessionId}] Could not load store file:`, e.message);
+                    }
                 }
             }
 
             // Save store periodically (every 30 seconds) and cleanup old media
-            this.storeInterval = setInterval(() => {
+            this.storeInterval = setInterval(async () => {
                 try {
                     // Cleanup old media files before saving (keep only last 100 per chat)
                     this.store.cleanupOldMedia(100);
-                    this.store.writeToFile(this.storeFile);
+
+                    if (this.useSupabase) {
+                        await this.store.saveToSupabase();
+                    } else {
+                        this.store.writeToFile(this.storeFile);
+                    }
                 } catch (e) {
                     // Silent fail
                 }
             }, 30_000);
 
-            const { state, saveCreds } = await useMultiFileAuthState(this.authFolder);
+            // Get auth state (Supabase or filesystem)
+            let state, saveCreds;
+            if (this.useSupabase) {
+                const authResult = await useSupabaseAuthState(this.sessionId);
+                state = authResult.state;
+                saveCreds = authResult.saveCreds;
+                console.log(`🔐 [${this.sessionId}] Using Supabase auth state`);
+            } else {
+                // Ensure auth folder exists for filesystem mode
+                if (!fs.existsSync(this.authFolder)) {
+                    fs.mkdirSync(this.authFolder, { recursive: true });
+                }
+                const authResult = await useMultiFileAuthState(this.authFolder);
+                state = authResult.state;
+                saveCreds = authResult.saveCreds;
+            }
+
             const { version } = await fetchLatestBaileysVersion();
 
             this.socket = makeWASocket({
@@ -218,31 +304,31 @@ class WhatsAppSession {
                 this.qrCode = await qrcode.toDataURL(qr);
                 this.connectionStatus = 'qr_ready';
                 console.log(`📱 [${this.sessionId}] QR Code generated! Scan dengan WhatsApp Anda.`);
-                
+
                 // Emit QR code to WebSocket
                 wsManager.emitQRCode(this.sessionId, this.qrCode);
             }
 
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                
+
                 console.log(`❌ [${this.sessionId}] Connection closed:`, lastDisconnect?.error?.message);
                 this.connectionStatus = 'disconnected';
                 this.qrCode = null;
-                
+
                 // Emit connection status to WebSocket
                 wsManager.emitConnectionStatus(this.sessionId, 'disconnected', {
                     reason: lastDisconnect?.error?.message,
                     shouldReconnect
                 });
-                
+
                 // Send webhook
                 this._sendWebhook('connection.update', {
                     status: 'disconnected',
                     reason: lastDisconnect?.error?.message,
                     shouldReconnect
                 });
-                
+
                 if (shouldReconnect) {
                     console.log(`🔄 [${this.sessionId}] Reconnecting...`);
                     setTimeout(() => this.connect(), 5000);
@@ -255,19 +341,19 @@ class WhatsAppSession {
                 console.log(`✅ [${this.sessionId}] WhatsApp Connected Successfully!`);
                 this.connectionStatus = 'connected';
                 this.qrCode = null;
-                
+
                 if (this.socket.user) {
                     this.phoneNumber = this.socket.user.id.split(':')[0];
                     this.name = this.socket.user.name || 'Unknown';
                     console.log(`👤 [${this.sessionId}] Connected as: ${this.name} (${this.phoneNumber})`);
                 }
-                
+
                 // Emit connection status to WebSocket
                 wsManager.emitConnectionStatus(this.sessionId, 'connected', {
                     phoneNumber: this.phoneNumber,
                     name: this.name
                 });
-                
+
                 // Send webhook
                 this._sendWebhook('connection.update', {
                     status: 'connected',
@@ -277,7 +363,7 @@ class WhatsAppSession {
             } else if (connection === 'connecting') {
                 console.log(`🔄 [${this.sessionId}] Connecting to WhatsApp...`);
                 this.connectionStatus = 'connecting';
-                
+
                 // Emit connection status to WebSocket
                 wsManager.emitConnectionStatus(this.sessionId, 'connecting');
             }
@@ -293,32 +379,32 @@ class WhatsAppSession {
                 if (!m?.messages || !Array.isArray(m.messages) || m.messages.length === 0) {
                     return;
                 }
-                
+
                 const message = m.messages[0];
-                
+
                 // Validate message structure
                 if (!message || !message.key || !message.key.remoteJid) {
                     console.log(`⚠️ [${this.sessionId}] Received invalid message structure, skipping`);
                     return;
                 }
-                
+
                 if (!message.key.fromMe && m.type === 'notify') {
                     console.log(`📩 [${this.sessionId}] New message from:`, message.key.remoteJid);
-                    
+
                     // Auto-save media if present
                     await this._autoSaveMedia(message);
-                    
+
                     // Emit message to WebSocket
                     const formattedMessage = MessageFormatter.formatMessage(message);
                     wsManager.emitMessage(this.sessionId, formattedMessage);
-                    
+
                     // Send webhook
                     this._sendWebhook('message', formattedMessage);
                 } else if (message.key.fromMe && m.type === 'notify') {
                     // Message sent confirmation
                     const formattedMessage = MessageFormatter.formatMessage(message);
                     wsManager.emitMessageSent(this.sessionId, formattedMessage);
-                    
+
                     // Send webhook
                     this._sendWebhook('message.sent', formattedMessage);
                 }
@@ -478,20 +564,38 @@ class WhatsAppSession {
             if (this.storeInterval) {
                 clearInterval(this.storeInterval);
             }
-            
+
             // Clear store and delete all media files
             if (this.store) {
+                if (this.useSupabase) {
+                    await this.store.deleteFromSupabase();
+                }
                 this.store.clear();
             }
-            
-            // Delete media folder for this session
-            this.deleteMediaFolder();
-            
+
+            // Delete media (Supabase Storage or local folder)
+            await this.deleteMediaFolder();
+
             if (this.socket) {
                 await this.socket.logout();
                 this.socket = null;
             }
-            this.deleteAuthFolder();
+
+            await this.deleteAuthFolder();
+
+            // Update session status in Supabase
+            if (this.useSupabase) {
+                try {
+                    const supabase = getSupabaseClient();
+                    await supabase
+                        .from('wa_sessions')
+                        .delete()
+                        .eq('session_id', this.sessionId);
+                } catch (e) {
+                    // Silent fail
+                }
+            }
+
             this.connectionStatus = 'disconnected';
             this.qrCode = null;
             this.phoneNumber = null;
@@ -502,7 +606,13 @@ class WhatsAppSession {
         }
     }
 
-    deleteAuthFolder() {
+    async deleteAuthFolder() {
+        // Delete from Supabase if configured
+        if (this.useSupabase) {
+            await deleteSupabaseAuthState(this.sessionId);
+        }
+
+        // Also delete local folder
         try {
             if (fs.existsSync(this.authFolder)) {
                 fs.rmSync(this.authFolder, { recursive: true, force: true });
@@ -513,7 +623,13 @@ class WhatsAppSession {
         }
     }
 
-    deleteMediaFolder() {
+    async deleteMediaFolder() {
+        // Delete from Supabase Storage if configured
+        if (this.useSupabase && this.supabaseStorage) {
+            await this.supabaseStorage.deleteAllMedia();
+        }
+
+        // Also delete local folder
         try {
             if (fs.existsSync(this.mediaFolder)) {
                 fs.rmSync(this.mediaFolder, { recursive: true, force: true });
@@ -543,18 +659,18 @@ class WhatsAppSession {
 
     formatJid(id, isGroup = false) {
         if (id.includes('@')) return id;
-        
+
         let formatted = id.replace(/\D/g, '');
         if (formatted.startsWith('0')) {
             formatted = '62' + formatted.slice(1);
         }
-        
+
         return isGroup ? `${formatted}@g.us` : `${formatted}@s.whatsapp.net`;
     }
 
     formatChatId(chatId) {
         if (chatId.includes('@')) return chatId;
-        
+
         let formatted = chatId.replace(/\D/g, '');
         if (formatted.startsWith('0')) {
             formatted = '62' + formatted.slice(1);
@@ -581,7 +697,7 @@ class WhatsAppSession {
 
             const jid = this.formatChatId(chatId);
             await this.socket.sendPresenceUpdate(presence, jid);
-            
+
             return { success: true, message: `Presence '${presence}' sent` };
         } catch (error) {
             return { success: false, message: error.message };
@@ -608,13 +724,13 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = { text: message };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 // Try to get the message from store first
@@ -633,11 +749,11 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
-            
-            return { 
-                success: true, 
+
+            return {
+                success: true,
                 message: 'Message sent successfully',
                 data: {
                     messageId: result.key.id,
@@ -657,16 +773,16 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 image: { url: imageUrl },
                 caption: caption
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -683,7 +799,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -707,10 +823,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 document: { url: documentUrl },
                 fileName: filename,
@@ -718,7 +834,7 @@ class WhatsAppSession {
                 caption: caption || undefined
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -735,7 +851,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -769,28 +885,28 @@ class WhatsAppSession {
             // Validate OGG format
             const urlLower = audioUrl.toLowerCase();
             if (!urlLower.endsWith('.ogg') && !urlLower.includes('.ogg?')) {
-                return { 
-                    success: false, 
-                    message: 'Audio must be in OGG format (.ogg). WhatsApp only supports OGG audio files.' 
+                return {
+                    success: false,
+                    message: 'Audio must be in OGG format (.ogg). WhatsApp only supports OGG audio files.'
                 };
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate recording if typingTime > 0
             if (typingTime > 0) {
                 await this.socket.sendPresenceUpdate('recording', jid);
                 await new Promise(resolve => setTimeout(resolve, typingTime));
                 await this.socket.sendPresenceUpdate('paused', jid);
             }
-            
+
             const messageContent = {
                 audio: { url: audioUrl },
                 ptt: ptt, // true = voice note, false = audio file
                 mimetype: 'audio/ogg; codecs=opus'
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -807,7 +923,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -831,10 +947,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 location: {
                     degreesLatitude: latitude,
@@ -843,7 +959,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -860,7 +976,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -884,12 +1000,12 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL;type=VOICE;waid=${contactPhone}:+${contactPhone}\nEND:VCARD`;
-            
+
             const messageContent = {
                 contacts: {
                     displayName: contactName,
@@ -897,7 +1013,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -914,7 +1030,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -944,14 +1060,14 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             // WhatsApp deprecated regular buttons in 2022
             // Using Poll as an alternative for interactive choices
             const pollName = footer ? `${text}\n\n${footer}` : text;
-            
+
             const messageContent = {
                 poll: {
                     name: pollName,
@@ -960,7 +1076,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -977,7 +1093,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1006,10 +1122,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 poll: {
                     name: question,
@@ -1018,7 +1134,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1035,7 +1151,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1062,7 +1178,7 @@ class WhatsAppSession {
 
             const jid = this.formatPhoneNumber(phone);
             const [result] = await this.socket.onWhatsApp(jid.replace('@s.whatsapp.net', ''));
-            
+
             return {
                 success: true,
                 data: {
@@ -1084,7 +1200,7 @@ class WhatsAppSession {
 
             const jid = this.formatPhoneNumber(phone);
             const ppUrl = await this.socket.profilePictureUrl(jid, 'image');
-            
+
             return {
                 success: true,
                 data: {
@@ -1093,12 +1209,12 @@ class WhatsAppSession {
                 }
             };
         } catch (error) {
-            return { 
-                success: true, 
-                data: { 
-                    phone: phone, 
-                    profilePicture: null 
-                } 
+            return {
+                success: true,
+                data: {
+                    phone: phone,
+                    profilePicture: null
+                }
             };
         }
     }
@@ -1110,23 +1226,23 @@ class WhatsAppSession {
             }
 
             const jid = this.formatPhoneNumber(phone);
-            
+
             let profilePicture = null;
             try {
                 profilePicture = await this.socket.profilePictureUrl(jid, 'image');
-            } catch (e) {}
+            } catch (e) { }
 
             let status = null;
             try {
                 const statusResult = await this.socket.fetchStatus(jid);
                 status = statusResult?.status || null;
-            } catch (e) {}
+            } catch (e) { }
 
             let isRegistered = false;
             try {
                 const [result] = await this.socket.onWhatsApp(jid.replace('@s.whatsapp.net', ''));
                 isRegistered = !!result?.exists;
-            } catch (e) {}
+            } catch (e) { }
 
             return {
                 success: true,
@@ -1347,18 +1463,18 @@ class WhatsAppSession {
 
             const jid = this.formatChatId(chatId);
             const isGroup = this.isGroupId(jid);
-            
+
             let messages = [];
-            
+
             // Try to fetch from server first (if fetchMessageHistory is available)
             if (typeof this.socket.fetchMessageHistory === 'function') {
                 try {
-                    const cursorMsg = cursor ? { 
-                        before: { 
-                            id: cursor, 
+                    const cursorMsg = cursor ? {
+                        before: {
+                            id: cursor,
                             fromMe: false,
-                            remoteJid: jid 
-                        } 
+                            remoteJid: jid
+                        }
                     } : undefined;
 
                     const result = await this.socket.fetchMessageHistory(limit, cursorMsg, jid);
@@ -1394,8 +1510,8 @@ class WhatsAppSession {
                     isGroup: isGroup,
                     total: formattedMessages.length,
                     limit: limit,
-                    cursor: formattedMessages.length > 0 
-                        ? formattedMessages[formattedMessages.length - 1].id 
+                    cursor: formattedMessages.length > 0
+                        ? formattedMessages[formattedMessages.length - 1].id
                         : null,
                     hasMore: formattedMessages.length === limit,
                     messages: formattedMessages
@@ -1414,11 +1530,11 @@ class WhatsAppSession {
 
             const jid = this.formatChatId(chatId);
             const isGroup = this.isGroupId(jid);
-            
+
             let profilePicture = null;
             try {
                 profilePicture = await this.socket.profilePictureUrl(jid, 'image');
-            } catch (e) {}
+            } catch (e) { }
 
             if (isGroup) {
                 try {
@@ -1448,18 +1564,18 @@ class WhatsAppSession {
                 }
             } else {
                 const phone = jid.split('@')[0];
-                
+
                 let status = null;
                 try {
                     const statusResult = await this.socket.fetchStatus(jid);
                     status = statusResult?.status || null;
-                } catch (e) {}
+                } catch (e) { }
 
                 let isRegistered = false;
                 try {
                     const [result] = await this.socket.onWhatsApp(phone);
                     isRegistered = !!result?.exists;
-                } catch (e) {}
+                } catch (e) { }
 
                 return {
                     success: true,
@@ -1499,7 +1615,7 @@ class WhatsAppSession {
             // Get messages from store
             const storeMessages = this.store?.getMessages(jid, { limit: 50 }) || [];
             console.log(`[${this.sessionId}] Found ${storeMessages.length} messages in store for ${jid}`);
-            
+
             // Collect message keys to mark as read
             const keysToRead = [];
             for (const msg of storeMessages) {
@@ -1516,7 +1632,7 @@ class WhatsAppSession {
                     keysToRead.push(readKey);
                 }
             }
-            
+
             if (keysToRead.length > 0) {
                 console.log(`[${this.sessionId}] Marking ${keysToRead.length} messages as read`);
                 await this.socket.readMessages(keysToRead);
@@ -1551,7 +1667,7 @@ class WhatsAppSession {
 
             const contentType = getContentType(message.message);
             const mediaTypes = ['imageMessage', 'audioMessage', 'documentMessage', 'stickerMessage']; // 'videoMessage' can be added if needed
-            
+
             if (!contentType || !mediaTypes.includes(contentType)) return null;
 
             const mediaContent = message.message[contentType];
@@ -1565,21 +1681,37 @@ class WhatsAppSession {
                 { logger: console, reuploadRequest: this.socket?.updateMediaMessage }
             );
 
-            // Create media folder structure: public/media/{sessionId}/{chatId}/
+            const mimetype = mediaContent.mimetype || this._getMimetype(contentType);
+            const ext = this._getExtFromMimetype(mimetype);
             const chatId = message.key.remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+            const filename = mediaContent.fileName || `${message.key.id}.${ext}`;
+
+            let mediaPath = null;
+            let mediaUrl = null;
+
+            // Upload to Supabase Storage if configured
+            if (this.useSupabase && this.supabaseStorage) {
+                const extension = '.' + ext;
+                const result = await this.supabaseStorage.uploadMedia(
+                    message.key.id,
+                    buffer,
+                    mimetype,
+                    extension
+                );
+
+                if (result.success) {
+                    mediaUrl = result.url;
+                    mediaPath = result.path;
+                    console.log(`📤 [${this.sessionId}] Media uploaded to Supabase: ${result.path}`);
+                }
+            }
+
+            // Also save locally as fallback/cache
             const mediaDir = path.join(this.mediaFolder, chatId);
-            
             if (!fs.existsSync(mediaDir)) {
                 fs.mkdirSync(mediaDir, { recursive: true });
             }
-
-            // Generate filename
-            const mimetype = mediaContent.mimetype || this._getMimetype(contentType);
-            const ext = this._getExtFromMimetype(mimetype);
-            const filename = mediaContent.fileName || `${message.key.id}.${ext}`;
             const filePath = path.join(mediaDir, filename);
-
-            // Save file
             fs.writeFileSync(filePath, buffer);
 
             // Register media file in store for cleanup tracking
@@ -1589,7 +1721,7 @@ class WhatsAppSession {
 
             // Store media path in message for later reference
             const relativePath = `/media/${this.sessionId}/${chatId}/${filename}`;
-            
+
             console.log(`💾 [${this.sessionId}] Media saved: ${relativePath}`);
 
             // Update message in store with media path
@@ -1600,11 +1732,15 @@ class WhatsAppSession {
                     if (msg) {
                         msg._mediaPath = relativePath;
                         msg._mediaLocalPath = filePath;
+                        // Add Supabase URL if available
+                        if (mediaUrl) {
+                            msg._mediaSupabaseUrl = mediaUrl;
+                        }
                     }
                 }
             }
 
-            return relativePath;
+            return this.useSupabase && mediaUrl ? mediaUrl : relativePath;
         } catch (error) {
             console.error(`[${this.sessionId}] Auto-save media error:`, error.message);
             return null;
@@ -2052,7 +2188,7 @@ class WhatsAppSession {
             }
 
             const groups = await this.socket.groupFetchAllParticipating();
-            
+
             const groupList = Object.values(groups).map(g => ({
                 id: g.id,
                 subject: g.subject,
@@ -2099,9 +2235,9 @@ class WhatsAppSession {
 
             const validSettings = ['announcement', 'not_announcement', 'locked', 'unlocked'];
             if (!validSettings.includes(setting)) {
-                return { 
-                    success: false, 
-                    message: `Invalid setting. Use: ${validSettings.join(', ')}` 
+                return {
+                    success: false,
+                    message: `Invalid setting. Use: ${validSettings.join(', ')}`
                 };
             }
 

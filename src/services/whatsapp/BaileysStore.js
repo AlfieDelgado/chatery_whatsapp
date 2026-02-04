@@ -5,21 +5,21 @@
 class BaileysStore {
   constructor(sessionId = null) {
     this.sessionId = sessionId;
-    
+
     // Core data stores
     this.chats = new Map();
     this.contacts = new Map();
     this.messages = new Map();
     this.groupMetadata = new Map();
-    
+
     // Optimized caches for fast queries
     this.chatsOverview = new Map(); // Pre-computed chat overview
     this.profilePictures = new Map(); // Cached profile pictures
     this.contactsCache = new Map(); // Cached contacts with profile pics
-    
+
     // Media files tracking: messageId -> filePath
     this.mediaFiles = new Map();
-    
+
     // Cache timestamps
     this.lastOverviewUpdate = 0;
     this.lastContactsUpdate = 0;
@@ -93,7 +93,7 @@ class BaileysStore {
       for (const msg of messages) {
         // Skip null/invalid messages
         if (!msg || !msg.key || !msg.key.remoteJid || !msg.key.id) continue;
-        
+
         const chatId = msg.key.remoteJid;
         if (!this.messages.has(chatId)) {
           this.messages.set(chatId, new Map());
@@ -107,7 +107,7 @@ class BaileysStore {
       for (const msg of messages) {
         // Skip null/invalid messages
         if (!msg || !msg.key || !msg.key.remoteJid || !msg.key.id) continue;
-        
+
         const chatId = msg.key.remoteJid;
         if (!this.messages.has(chatId)) {
           this.messages.set(chatId, new Map());
@@ -121,7 +121,7 @@ class BaileysStore {
       for (const { key, update } of updates) {
         // Skip invalid updates
         if (!key || !key.remoteJid || !key.id) continue;
-        
+
         const chatMessages = this.messages.get(key.remoteJid);
         if (chatMessages) {
           const existing = chatMessages.get(key.id);
@@ -137,7 +137,7 @@ class BaileysStore {
         for (const key of item.keys) {
           // Skip invalid keys
           if (!key || !key.remoteJid) continue;
-          
+
           const chatMessages = this.messages.get(key.remoteJid);
           if (chatMessages) {
             chatMessages.delete(key.id);
@@ -171,7 +171,7 @@ class BaileysStore {
   _updateSingleChatOverview(chatId, newMessage = null) {
     const chat = this.chats.get(chatId);
     const chatMessages = this.messages.get(chatId);
-    
+
     if (!chatMessages || chatMessages.size === 0) {
       this.chatsOverview.delete(chatId);
       return;
@@ -219,9 +219,9 @@ class BaileysStore {
    */
   _extractMessagePreview(message) {
     if (!message?.message) return '';
-    
+
     const msg = message.message;
-    
+
     if (msg.conversation) return msg.conversation.substring(0, 100);
     if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text.substring(0, 100);
     if (msg.imageMessage) return '📷 Image';
@@ -234,7 +234,7 @@ class BaileysStore {
     if (msg.buttonsMessage) return msg.buttonsMessage.contentText || 'Buttons';
     if (msg.templateMessage) return 'Template Message';
     if (msg.listMessage) return msg.listMessage.title || 'List';
-    
+
     return 'Message';
   }
 
@@ -277,12 +277,12 @@ class BaileysStore {
    */
   getChatsOverviewFast(options = {}) {
     const { limit = 50, offset = 0 } = options;
-    
+
     // Build overview if empty
     if (this.chatsOverview.size === 0) {
       this._rebuildOverviewCache();
     }
-    
+
     // Convert to array and sort by timestamp
     let overview = Array.from(this.chatsOverview.values());
     overview.sort((a, b) => {
@@ -290,7 +290,7 @@ class BaileysStore {
       const timeB = b.conversationTimestamp || b.lastMessage?.timestamp || 0;
       return timeB - timeA;
     });
-    
+
     // Apply pagination
     return {
       total: overview.length,
@@ -305,7 +305,7 @@ class BaileysStore {
    */
   _rebuildOverviewCache() {
     this.chatsOverview.clear();
-    
+
     for (const [chatId, chatMessages] of this.messages) {
       if (chatMessages.size > 0) {
         this._updateSingleChatOverview(chatId);
@@ -318,7 +318,7 @@ class BaileysStore {
    */
   getContactsFast(options = {}) {
     const { limit = 100, offset = 0, search = '' } = options;
-    
+
     let contacts = Array.from(this.contacts.values())
       .filter(c => c.id.endsWith('@s.whatsapp.net'))
       .map(c => ({
@@ -328,20 +328,20 @@ class BaileysStore {
         verifiedName: c.verifiedName,
         profilePicture: this.profilePictures.get(c.id) || null
       }));
-    
+
     // Apply search filter
     if (search) {
       const searchLower = search.toLowerCase();
-      contacts = contacts.filter(c => 
+      contacts = contacts.filter(c =>
         c.name?.toLowerCase().includes(searchLower) ||
         c.notify?.toLowerCase().includes(searchLower) ||
         c.id.includes(search)
       );
     }
-    
+
     // Sort by name
     contacts.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-    
+
     return {
       total: contacts.length,
       offset,
@@ -363,25 +363,25 @@ class BaileysStore {
   getMessages(chatId, options = {}) {
     const { limit = 50, before = null } = options;
     const chatMessages = this.messages.get(chatId);
-    
+
     if (!chatMessages) return [];
-    
+
     let messages = Array.from(chatMessages.values())
       .filter(m => m && m.key && m.messageTimestamp); // Filter invalid messages
-    
+
     messages.sort((a, b) => {
       const timeA = typeof a.messageTimestamp === 'object' ? (a.messageTimestamp.low || 0) : (a.messageTimestamp || 0);
       const timeB = typeof b.messageTimestamp === 'object' ? (b.messageTimestamp.low || 0) : (b.messageTimestamp || 0);
       return timeB - timeA;
     });
-    
+
     if (before) {
       const beforeIndex = messages.findIndex(m => m.key?.id === before);
       if (beforeIndex > -1) {
         messages = messages.slice(beforeIndex + 1);
       }
     }
-    
+
     return messages.slice(0, limit);
   }
 
@@ -420,7 +420,7 @@ class BaileysStore {
    */
   _safeSerialize(data) {
     const seen = new WeakSet();
-    
+
     return JSON.stringify(data, (key, value) => {
       // Skip binary data and buffers
       if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
@@ -429,12 +429,12 @@ class BaileysStore {
       if (Buffer.isBuffer && Buffer.isBuffer(value)) {
         return undefined;
       }
-      
+
       // Skip functions
       if (typeof value === 'function') {
         return undefined;
       }
-      
+
       // Handle circular references
       if (typeof value === 'object' && value !== null) {
         if (seen.has(value)) {
@@ -442,7 +442,7 @@ class BaileysStore {
         }
         seen.add(value);
       }
-      
+
       return value;
     }, 2);
   }
@@ -453,14 +453,14 @@ class BaileysStore {
   writeToFile(filePath) {
     const fs = require('fs');
     const path = require('path');
-    
+
     try {
       // Ensure directory exists
       const dir = path.dirname(filePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      
+
       // Convert Maps to arrays for serialization
       const data = {
         chats: Array.from(this.chats.entries()),
@@ -472,20 +472,20 @@ class BaileysStore {
         groupMetadata: Array.from(this.groupMetadata.entries()),
         profilePictures: Array.from(this.profilePictures.entries())
       };
-      
+
       // Use safe serialization to avoid .enc or corrupted files
       const jsonContent = this._safeSerialize(data);
-      
+
       // Write to temp file first, then rename (atomic write)
       const tempPath = filePath + '.tmp';
       fs.writeFileSync(tempPath, jsonContent, 'utf8');
-      
+
       // Rename temp to final (atomic on most filesystems)
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }
       fs.renameSync(tempPath, filePath);
-      
+
       return true;
     } catch (error) {
       console.error('Error writing store to file:', error.message);
@@ -498,20 +498,20 @@ class BaileysStore {
    */
   readFromFile(filePath) {
     const fs = require('fs');
-    
+
     try {
       if (!fs.existsSync(filePath)) {
         return false;
       }
-      
+
       const content = fs.readFileSync(filePath, 'utf8');
-      
+
       // Validate JSON before parsing
       if (!content || content.trim() === '') {
         console.warn('Store file is empty');
         return false;
       }
-      
+
       // Check if file is corrupted (e.g., .enc issue)
       if (!content.startsWith('{')) {
         console.warn('Store file appears corrupted, skipping restore');
@@ -519,9 +519,9 @@ class BaileysStore {
         fs.unlinkSync(filePath);
         return false;
       }
-      
+
       const data = JSON.parse(content);
-      
+
       // Restore Maps
       if (data.chats) {
         this.chats = new Map(data.chats);
@@ -540,13 +540,143 @@ class BaileysStore {
       if (data.profilePictures) {
         this.profilePictures = new Map(data.profilePictures);
       }
-      
+
       // Rebuild overview cache after restore
       this._rebuildOverviewCache();
-      
+
       return true;
     } catch (error) {
       console.error('Error reading store from file:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Save store to Supabase (for Cloud Run persistence)
+   */
+  async saveToSupabase() {
+    try {
+      const { getSupabaseClient, isSupabaseConfigured } = require('../supabase');
+
+      if (!isSupabaseConfigured()) {
+        return false;
+      }
+
+      const supabase = getSupabaseClient();
+
+      // Convert Maps to arrays for serialization
+      const storeData = {
+        chats: Array.from(this.chats.entries()),
+        contacts: Array.from(this.contacts.entries()),
+        messages: Array.from(this.messages.entries()).map(([chatId, msgs]) => [
+          chatId,
+          Array.from(msgs.entries()).slice(-100) // Keep only last 100 messages per chat
+        ]),
+        groupMetadata: Array.from(this.groupMetadata.entries()),
+        profilePictures: Array.from(this.profilePictures.entries())
+      };
+
+      // Use safe serialization to avoid circular references
+      const safeData = JSON.parse(this._safeSerialize(storeData));
+
+      const { error } = await supabase
+        .from('wa_store')
+        .upsert({
+          session_id: this.sessionId,
+          store_data: safeData
+        }, {
+          onConflict: 'session_id'
+        });
+
+      if (error) {
+        console.error(`[${this.sessionId}] Error saving store to Supabase:`, error.message);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error(`[${this.sessionId}] Error saving store to Supabase:`, error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Load store from Supabase (for Cloud Run persistence)
+   */
+  async loadFromSupabase() {
+    try {
+      const { getSupabaseClient, isSupabaseConfigured } = require('../supabase');
+
+      if (!isSupabaseConfigured()) {
+        return false;
+      }
+
+      const supabase = getSupabaseClient();
+
+      const { data, error } = await supabase
+        .from('wa_store')
+        .select('store_data')
+        .eq('session_id', this.sessionId)
+        .single();
+
+      if (error || !data || !data.store_data) {
+        return false;
+      }
+
+      const storeData = data.store_data;
+
+      // Restore Maps
+      if (storeData.chats) {
+        this.chats = new Map(storeData.chats);
+      }
+      if (storeData.contacts) {
+        this.contacts = new Map(storeData.contacts);
+      }
+      if (storeData.messages) {
+        this.messages = new Map(
+          storeData.messages.map(([chatId, msgs]) => [chatId, new Map(msgs)])
+        );
+      }
+      if (storeData.groupMetadata) {
+        this.groupMetadata = new Map(storeData.groupMetadata);
+      }
+      if (storeData.profilePictures) {
+        this.profilePictures = new Map(storeData.profilePictures);
+      }
+
+      // Rebuild overview cache after restore
+      this._rebuildOverviewCache();
+
+      console.log(`📂 [${this.sessionId}] Store data loaded from Supabase`);
+      return true;
+    } catch (error) {
+      console.error(`[${this.sessionId}] Error loading store from Supabase:`, error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Delete store data from Supabase
+   */
+  async deleteFromSupabase() {
+    try {
+      const { getSupabaseClient, isSupabaseConfigured } = require('../supabase');
+
+      if (!isSupabaseConfigured()) {
+        return false;
+      }
+
+      const supabase = getSupabaseClient();
+
+      await supabase
+        .from('wa_store')
+        .delete()
+        .eq('session_id', this.sessionId);
+
+      console.log(`🗑️ [${this.sessionId}] Store data deleted from Supabase`);
+      return true;
+    } catch (error) {
+      console.error(`[${this.sessionId}] Error deleting store from Supabase:`, error.message);
       return false;
     }
   }
@@ -557,7 +687,7 @@ class BaileysStore {
   clear() {
     // Clean up all media files first
     this._cleanupAllMedia();
-    
+
     this.chats.clear();
     this.contacts.clear();
     this.messages.clear();
@@ -576,7 +706,7 @@ class BaileysStore {
     for (const [, chatMessages] of this.messages) {
       totalMessages += chatMessages.size;
     }
-    
+
     return {
       chats: this.chats.size,
       contacts: this.contacts.size,
@@ -635,7 +765,7 @@ class BaileysStore {
   cleanupOldMedia(maxMessagesPerChat = 100) {
     const fs = require('fs');
     const messagesToKeep = new Set();
-    
+
     // Collect message IDs that should be kept
     for (const [chatId, chatMessages] of this.messages) {
       const msgs = Array.from(chatMessages.values())
@@ -646,14 +776,14 @@ class BaileysStore {
           return timeB - timeA;
         })
         .slice(0, maxMessagesPerChat);
-      
+
       for (const msg of msgs) {
         if (msg.key?.id) {
           messagesToKeep.add(msg.key.id);
         }
       }
     }
-    
+
     // Delete media files for messages that will be removed
     for (const [messageId, filePath] of this.mediaFiles) {
       if (!messagesToKeep.has(messageId)) {
